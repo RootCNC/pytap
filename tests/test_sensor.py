@@ -1,5 +1,6 @@
 """Tests for the PyTap sensor platform."""
 
+from datetime import timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from homeassistant.components.sensor import SensorStateClass
@@ -23,13 +24,21 @@ from custom_components.pytap.const import (
     CONF_MODULES,
     DEFAULT_PORT,
     DOMAIN,
+    STALE_TIMEOUT_SECONDS,
 )
-from custom_components.pytap.coordinator import PyTapDataUpdateCoordinator
+from custom_components.pytap.coordinator import (
+    PyTapDataUpdateCoordinator,
+    node_is_fresh,
+)
 from custom_components.pytap.sensor import (
     SENSOR_DESCRIPTIONS,
     _coerce_restored_state_value,
     async_setup_entry,
 )
+
+# Node timestamps must be recent, otherwise live readings are treated as stale
+# (optimizers stop reporting at dusk) and sensors go unavailable.
+FRESH_TS = dt_util.utcnow().isoformat()
 
 MOCK_MODULES = [
     {
@@ -67,7 +76,7 @@ MOCK_NODE_DATA = {
         "total_energy_wh": 4567.89,
         "readings_today": 42,
         "daily_reset_date": "2025-01-01",
-        "last_update": "2025-01-01T12:00:00",
+        "last_update": FRESH_TS,
     },
 }
 
@@ -101,7 +110,7 @@ MOCK_NODE_DATA_TWO = {
         "total_energy_wh": 4100.0,
         "readings_today": 10,
         "daily_reset_date": "2025-01-01",
-        "last_update": "2025-01-01T12:00:30",
+        "last_update": FRESH_TS,
     },
 }
 
@@ -903,7 +912,7 @@ def test_coerce_restored_state_value_ignores_unavailable() -> None:
 async def test_restart_restores_snapshot_before_live_stream(
     hass: HomeAssistant,
 ) -> None:
-    """After restart, sensors should be available from restored snapshot data."""
+    """After restart, energy restores from snapshot; stale live readings do not."""
     entry = MockConfigEntry(
         domain=DOMAIN,
         data={
@@ -970,8 +979,14 @@ async def test_restart_restores_snapshot_before_live_stream(
     assert power_entity_id is not None
     power_state = hass.states.get(power_entity_id)
     assert power_state is not None
-    assert power_state.state != STATE_UNAVAILABLE
-    assert float(power_state.state) == 299.2
+    # Snapshot is from hours ago — the module is not reporting now, so the
+    # last-known power must not be presented as current: it reads 0 W.
+    assert float(power_state.state) == 0.0
+
+    rssi_entity_id = ent_reg.async_get_entity_id(
+        "sensor", DOMAIN, f"{DOMAIN}_A-1234567B_rssi"
+    )
+    assert hass.states.get(rssi_entity_id).state == STATE_UNAVAILABLE
 
     # Verify energy sensors restore from coordinator snapshot (not zeroed)
     daily_energy_entity_id = ent_reg.async_get_entity_id(
@@ -998,14 +1013,23 @@ async def test_restart_restores_snapshot_before_live_stream(
     assert installation_power_entity_id is not None
     installation_power_state = hass.states.get(installation_power_entity_id)
     assert installation_power_state is not None
-    assert installation_power_state.state != STATE_UNAVAILABLE
-    assert float(installation_power_state.state) == 299.2
+    assert float(installation_power_state.state) == 0.0
+
+    installation_energy_entity_id = ent_reg.async_get_entity_id(
+        "sensor", DOMAIN, f"{DOMAIN}_{entry.entry_id}_installation_total_energy"
+    )
+    installation_energy_state = hass.states.get(installation_energy_entity_id)
+    assert float(installation_energy_state.state) == 2000.0
 
 
 async def test_restart_uses_restore_entity_fallback_without_snapshot(
     hass: HomeAssistant,
 ) -> None:
-    """When no snapshot exists, startup should restore values from HA state cache."""
+    """Without a snapshot, energy sensors restore from the HA state cache.
+
+    Live readings (power etc.) are never restored — they stay unavailable
+    until the optimizer reports again.
+    """
     entry = MockConfigEntry(
         domain=DOMAIN,
         data={
@@ -1061,8 +1085,14 @@ async def test_restart_uses_restore_entity_fallback_without_snapshot(
     assert power_entity_id is not None
     power_state = hass.states.get(power_entity_id)
     assert power_state is not None
-    assert power_state.state != STATE_UNAVAILABLE
-    assert float(power_state.state) == 123.4
+    assert power_state.state == STATE_UNAVAILABLE
+
+    total_energy_entity_id = ent_reg.async_get_entity_id(
+        "sensor", DOMAIN, f"{DOMAIN}_A-1234567B_total_energy"
+    )
+    total_energy_state = hass.states.get(total_energy_entity_id)
+    assert total_energy_state.state != STATE_UNAVAILABLE
+    assert float(total_energy_state.state) == 123.4
 
     installation_power_entity_id = ent_reg.async_get_entity_id(
         "sensor", DOMAIN, f"{DOMAIN}_{entry.entry_id}_installation_power"
@@ -1070,5 +1100,182 @@ async def test_restart_uses_restore_entity_fallback_without_snapshot(
     assert installation_power_entity_id is not None
     installation_power_state = hass.states.get(installation_power_entity_id)
     assert installation_power_state is not None
-    assert installation_power_state.state != STATE_UNAVAILABLE
-    assert float(installation_power_state.state) == 456.7
+    assert installation_power_state.state == STATE_UNAVAILABLE
+
+    installation_energy_entity_id = ent_reg.async_get_entity_id(
+        "sensor", DOMAIN, f"{DOMAIN}_{entry.entry_id}_installation_total_energy"
+    )
+    installation_energy_state = hass.states.get(installation_energy_entity_id)
+    assert installation_energy_state.state != STATE_UNAVAILABLE
+    assert float(installation_energy_state.state) == 456.7
+
+
+# ---------------------------------------------------------------------------
+# Staleness — optimizers stop reporting at dusk
+# ---------------------------------------------------------------------------
+
+
+def test_node_is_fresh() -> None:
+    """node_is_fresh compares last_update against the timeout."""
+    now = dt_util.utcnow()
+    recent = (now - timedelta(seconds=60)).isoformat()
+    old = (now - timedelta(seconds=STALE_TIMEOUT_SECONDS + 1)).isoformat()
+    assert node_is_fresh({"last_update": recent}, now) is True
+    assert node_is_fresh({"last_update": old}, now) is False
+    assert node_is_fresh({"last_update": None}, now) is False
+    assert node_is_fresh({"last_update": "garbage"}, now) is False
+    assert node_is_fresh(None, now) is False
+    # Naive timestamps are interpreted as local time
+    naive_local = dt_util.as_local(now - timedelta(seconds=30)).replace(tzinfo=None)
+    assert node_is_fresh({"last_update": naive_local.isoformat()}, now) is True
+
+
+def _stale_copy(node: dict) -> dict:
+    stale_ts = dt_util.utcnow() - timedelta(seconds=STALE_TIMEOUT_SECONDS + 60)
+    return {**node, "last_update": stale_ts.isoformat()}
+
+
+async def test_live_sensors_when_stale(hass: HomeAssistant) -> None:
+    """Quiet node: electrical readings -> 0, others unavailable, energy kept."""
+    entry = _make_mock_config_entry(hass)
+    node = MOCK_NODE_DATA["A-1234567B"]
+    coordinator = _make_mock_coordinator(
+        hass, entry, node_data={"A-1234567B": _stale_copy(node)}
+    )
+    hass.data.setdefault(DOMAIN, {})
+    hass.data[DOMAIN][entry.entry_id] = coordinator
+
+    entities = []
+    await async_setup_entry(hass, entry, lambda e: entities.extend(e))
+    by_id = {e.unique_id: e for e in entities}
+
+    for key in (
+        "power",
+        "performance",
+        "voltage_in",
+        "voltage_out",
+        "current_in",
+        "current_out",
+    ):
+        sensor = by_id[f"{DOMAIN}_A-1234567B_{key}"]
+        assert sensor.available is True, key
+        sensor.async_write_ha_state = MagicMock()
+        sensor._attr_native_value = 1.0
+        sensor._handle_coordinator_update()
+        assert sensor.native_value == 0.0, key
+
+    for key in ("temperature", "dc_dc_duty_cycle", "rssi"):
+        sensor = by_id[f"{DOMAIN}_A-1234567B_{key}"]
+        assert sensor.available is False, key
+        sensor.async_write_ha_state = MagicMock()
+        sensor._attr_native_value = 1.0
+        sensor._handle_coordinator_update()
+        assert sensor.native_value is None, key
+
+    for key in ("daily_energy", "total_energy", "readings_today"):
+        sensor = by_id[f"{DOMAIN}_A-1234567B_{key}"]
+        assert sensor.available is True, key
+
+
+async def test_live_sensor_recovers_when_reports_resume(
+    hass: HomeAssistant,
+) -> None:
+    """A stale sensor becomes available again on the next power report."""
+    entry = _make_mock_config_entry(hass)
+    node = MOCK_NODE_DATA["A-1234567B"]
+    coordinator = _make_mock_coordinator(
+        hass, entry, node_data={"A-1234567B": _stale_copy(node)}
+    )
+    hass.data.setdefault(DOMAIN, {})
+    hass.data[DOMAIN][entry.entry_id] = coordinator
+
+    entities = []
+    await async_setup_entry(hass, entry, lambda e: entities.extend(e))
+    power = next(e for e in entities if e.unique_id == f"{DOMAIN}_A-1234567B_power")
+    power.async_write_ha_state = MagicMock()
+    power._handle_coordinator_update()
+    assert power.native_value == 0.0
+
+    coordinator.data["nodes"]["A-1234567B"] = {
+        **node,
+        "power": 12.0,
+        "last_update": dt_util.utcnow().isoformat(),
+    }
+    power._handle_coordinator_update()
+    assert power.available is True
+    assert power.native_value == 12.0
+
+
+async def test_aggregate_power_ignores_stale_nodes(hass: HomeAssistant) -> None:
+    """Aggregate power sums only fresh nodes; energy sums all nodes."""
+    entry = _make_mock_config_entry(hass)
+    nodes = {
+        "A-1234567B": MOCK_NODE_DATA_TWO["A-1234567B"],
+        "C-2345678D": _stale_copy(MOCK_NODE_DATA_TWO["C-2345678D"]),
+    }
+    coordinator = _make_mock_coordinator(hass, entry, node_data=nodes)
+    hass.data.setdefault(DOMAIN, {})
+    hass.data[DOMAIN][entry.entry_id] = coordinator
+
+    entities = []
+    await async_setup_entry(hass, entry, lambda e: entities.extend(e))
+    by_id = {e.unique_id: e for e in entities}
+    for e in entities:
+        e.async_write_ha_state = MagicMock()
+
+    inst_power = by_id[f"{DOMAIN}_{entry.entry_id}_installation_power"]
+    inst_power._handle_coordinator_update()
+    assert inst_power.native_value == 300.0
+    assert inst_power.extra_state_attributes == {
+        "optimizer_count": 2,
+        "reporting_count": 1,
+    }
+
+    inst_energy = by_id[f"{DOMAIN}_{entry.entry_id}_installation_total_energy"]
+    inst_energy._handle_coordinator_update()
+    assert inst_energy.native_value == 8600.0
+
+    # String B has only the stale node -> 0 W / 0 %
+    string_b_power = by_id[f"{DOMAIN}_{entry.entry_id}_string_B_power"]
+    assert string_b_power.available is True
+    string_b_power._handle_coordinator_update()
+    assert string_b_power.native_value == 0.0
+    string_b_perf = by_id[f"{DOMAIN}_{entry.entry_id}_string_B_performance"]
+    string_b_perf._handle_coordinator_update()
+    assert string_b_perf.native_value == 0.0
+
+    # Strings/installation with no node ever seen stay unavailable
+    coordinator.data["nodes"] = {}
+    assert inst_power.available is False
+
+
+async def test_coordinator_stale_check_notifies_listeners(
+    hass: HomeAssistant,
+) -> None:
+    """The periodic check pushes an update when a node goes stale."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_HOST: "192.168.1.100",
+            CONF_PORT: DEFAULT_PORT,
+            CONF_MODULES: [MOCK_MODULES[0]],
+        },
+        entry_id="stale_check_entry",
+        version=4,
+    )
+    entry.add_to_hass(hass)
+    coordinator = PyTapDataUpdateCoordinator(hass, entry)
+    coordinator.data["nodes"]["A-1234567B"] = dict(MOCK_NODE_DATA["A-1234567B"])
+    coordinator._fresh_barcodes = coordinator._compute_fresh_barcodes()
+    assert coordinator._fresh_barcodes == {"A-1234567B"}
+
+    with patch.object(coordinator, "async_update_listeners") as update:
+        coordinator._async_check_stale()
+        update.assert_not_called()
+
+        coordinator.data["nodes"]["A-1234567B"] = _stale_copy(
+            MOCK_NODE_DATA["A-1234567B"]
+        )
+        coordinator._async_check_stale()
+        update.assert_called_once()
+        assert coordinator._fresh_barcodes == frozenset()

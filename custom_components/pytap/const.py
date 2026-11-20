@@ -29,6 +29,14 @@ RECONNECT_TIMEOUT = 60
 RECONNECT_DELAY = 5
 RECONNECT_RETRIES = 0
 
+# Staleness: optimizers stop transmitting when they lose input power (e.g.
+# after sunset).  If no power report has arrived for a node within this many
+# seconds, its readings stop holding the last value: power, performance,
+# voltage and current drop to 0, while temperature, duty cycle and RSSI
+# become unavailable.  Energy counters are unaffected.
+STALE_TIMEOUT_SECONDS = 300
+STALE_CHECK_INTERVAL_SECONDS = 30
+
 # Energy accumulation tuning
 ENERGY_GAP_THRESHOLD_SECONDS = 120
 ENERGY_LOW_POWER_THRESHOLD_W = 1.0
