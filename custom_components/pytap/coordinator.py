@@ -307,10 +307,18 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if went_stale:
             _LOGGER.debug(
                 "No power reports for %ds from %d optimizer(s), marking "
-                "readings unavailable: %s",
+                "offline (power/voltage/current -> 0, RSSI/temperature/"
+                "duty cycle -> unavailable): %s",
                 STALE_TIMEOUT_SECONDS,
                 len(went_stale),
                 ", ".join(sorted(went_stale)),
+            )
+        came_back = fresh - self._fresh_barcodes
+        if came_back:
+            _LOGGER.debug(
+                "%d optimizer(s) reporting again: %s",
+                len(came_back),
+                ", ".join(sorted(came_back)),
             )
         self._fresh_barcodes = fresh
         self.async_update_listeners()
