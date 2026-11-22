@@ -8,6 +8,7 @@ and filters events by user-configured barcodes.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from datetime import time as dt_time
 import logging
@@ -18,6 +19,7 @@ from typing import Any
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
@@ -40,6 +42,8 @@ from .const import (
     RECONNECT_DELAY,
     RECONNECT_RETRIES,
     RECONNECT_TIMEOUT,
+    STALE_CHECK_INTERVAL_SECONDS,
+    STALE_TIMEOUT_SECONDS,
 )
 from .energy import EnergyAccumulator, accumulate_energy
 from .pytap.core.events import (
@@ -69,6 +73,36 @@ _AVERAGED_FIELDS = (
     "dc_dc_duty_cycle",
     "rssi",
 )
+
+
+def node_is_fresh(
+    node: dict[str, Any] | None,
+    now: datetime | None = None,
+    timeout: float = STALE_TIMEOUT_SECONDS,
+) -> bool:
+    """Return True if a node has reported within ``timeout`` seconds.
+
+    Tigo TS4 optimizers stop transmitting once they lose input power (at
+    dusk), so the absence of recent power reports means the last readings
+    no longer describe the module.  Naive timestamps are treated as local
+    time.  A missing or unparseable ``last_update`` counts as stale.
+    """
+    if not node:
+        return False
+    raw = node.get("last_update")
+    if not raw:
+        return False
+    if isinstance(raw, datetime):
+        last = raw
+    else:
+        last = dt_util.parse_datetime(str(raw))
+        if last is None:
+            return False
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=dt_util.get_default_time_zone())
+    if now is None:
+        now = dt_util.utcnow()
+    return (now - last).total_seconds() <= timeout
 
 
 class _MigratingStore(Store):
@@ -168,6 +202,12 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Midnight reset timer handle
         self._midnight_reset_unsub: asyncio.TimerHandle | None = None
 
+        # Periodic staleness check — when the set of fresh nodes changes
+        # (e.g. optimizers go silent at dusk) listeners are notified so
+        # sensors can flip to unavailable even though no new data arrived.
+        self._stale_check_unsub: Callable[[], None] | None = None
+        self._fresh_barcodes: frozenset[str] = frozenset()
+
         # Source handle for cancellation — accessed from both threads
         self._source: Any = None
         self._source_lock = threading.Lock()
@@ -240,6 +280,48 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             name="pytap_listener",
         )
         self._schedule_midnight_reset()
+        self._fresh_barcodes = self._compute_fresh_barcodes()
+        self._stale_check_unsub = async_track_time_interval(
+            self.hass,
+            self._async_check_stale,
+            timedelta(seconds=STALE_CHECK_INTERVAL_SECONDS),
+        )
+
+    def _compute_fresh_barcodes(self) -> frozenset[str]:
+        """Return the barcodes whose last power report is within the timeout."""
+        now = dt_util.utcnow()
+        nodes = (self.data or {}).get("nodes", {})
+        return frozenset(
+            barcode
+            for barcode, node in list(nodes.items())
+            if node_is_fresh(node, now)
+        )
+
+    @callback
+    def _async_check_stale(self, _now: datetime | None = None) -> None:
+        """Notify listeners when a node transitions between fresh and stale."""
+        fresh = self._compute_fresh_barcodes()
+        if fresh == self._fresh_barcodes:
+            return
+        went_stale = self._fresh_barcodes - fresh
+        if went_stale:
+            _LOGGER.debug(
+                "No power reports for %ds from %d optimizer(s), marking "
+                "offline (power/voltage/current -> 0, RSSI/temperature/"
+                "duty cycle -> unavailable): %s",
+                STALE_TIMEOUT_SECONDS,
+                len(went_stale),
+                ", ".join(sorted(went_stale)),
+            )
+        came_back = fresh - self._fresh_barcodes
+        if came_back:
+            _LOGGER.debug(
+                "%d optimizer(s) reporting again: %s",
+                len(came_back),
+                ", ".join(sorted(came_back)),
+            )
+        self._fresh_barcodes = fresh
+        self.async_update_listeners()
 
     async def _async_listen(self) -> None:
         """Async wrapper to run the blocking listener in an executor."""
@@ -252,6 +334,9 @@ class PyTapDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self._midnight_reset_unsub is not None:
             self._midnight_reset_unsub.cancel()
             self._midnight_reset_unsub = None
+        if self._stale_check_unsub is not None:
+            self._stale_check_unsub()
+            self._stale_check_unsub = None
         # Flush any pending state save
         if self._save_task is not None:
             self._save_task.cancel()

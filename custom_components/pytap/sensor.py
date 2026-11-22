@@ -46,9 +46,32 @@ from .const import (
     DEFAULT_PEAK_POWER,
     DOMAIN,
 )
-from .coordinator import PyTapDataUpdateCoordinator
+from .coordinator import PyTapDataUpdateCoordinator, node_is_fresh
 
 _LOGGER = logging.getLogger(__name__)
+
+# Sensor keys that describe *accumulated* state rather than a live reading.
+# These keep their value (and are restored across restarts) when an
+# optimizer goes quiet; every other key is an instantaneous measurement that
+# becomes unavailable once the node's data is stale.
+ACCUMULATED_KEYS = frozenset({"daily_energy", "total_energy", "readings_today"})
+
+# Live readings that report 0 (rather than unavailable) once an optimizer
+# goes quiet.  A TS4 that has stopped transmitting is not producing, so zero
+# power/voltage/current is the physically correct value and keeps history
+# graphs and energy dashboards continuous overnight.  The remaining live keys
+# (temperature, duty cycle, RSSI) have no meaningful "off" value and become
+# unavailable instead.
+ZERO_WHEN_STALE_KEYS = frozenset(
+    {
+        "power",
+        "performance",
+        "voltage_in",
+        "voltage_out",
+        "current_in",
+        "current_out",
+    }
+)
 
 
 def _coerce_restored_state_value(raw_state: str, sensor_key: str) -> int | float | None:
@@ -374,12 +397,19 @@ class PyTapSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], RestoreSensor):
             serial_number=self._barcode,
         )
         self._restored_native_value = False
+        self._is_live = description.key not in ACCUMULATED_KEYS
+        self._zero_when_stale = description.key in ZERO_WHEN_STALE_KEYS
 
     async def async_added_to_hass(self) -> None:
         """Restore last known native value from Home Assistant state cache."""
         await super().async_added_to_hass()
         nodes = self.coordinator.data.get("nodes", {})
         node = nodes.get(self._barcode)
+        # Live readings are never restored from a previous run — a value from
+        # before the restart says nothing about what the module is doing now.
+        if self._is_live:
+            self._handle_coordinator_update()
+            return
         # Only short-circuit to coordinator data if this sensor has a non-None value.
         if node is not None:
             coordinator_value = node.get(self.entity_description.value_key)
@@ -411,12 +441,27 @@ class PyTapSensor(CoordinatorEntity[PyTapDataUpdateCoordinator], RestoreSensor):
         if not self.coordinator.data:
             return False
         node_data = self.coordinator.data.get("nodes", {}).get(self._barcode)
+        if self._is_live:
+            if self._zero_when_stale:
+                # Known module that has gone quiet still reports 0.
+                return node_data is not None
+            return node_is_fresh(node_data)
         return node_data is not None or self._restored_native_value
 
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
         node_data = self.coordinator.data.get("nodes", {}).get(self._barcode)
+        if self._is_live and not node_is_fresh(node_data):
+            # Optimizer has gone quiet (dusk / fault) — drop the held value.
+            # Electrical readings fall to 0; others become unavailable.
+            if self._zero_when_stale and node_data is not None:
+                self._attr_native_value = 0.0
+            else:
+                self._attr_native_value = None
+            self._restored_native_value = False
+            self.async_write_ha_state()
+            return
         if node_data:
             value = node_data.get(self.entity_description.value_key)
             # Convert duty cycle from 0.0-1.0 to percentage
@@ -495,10 +540,33 @@ class PyTapAggregateSensor(
         self._attr_unique_id = unique_id
         self._attr_device_info = device_info
         self._restored_native_value = False
+        self._is_live = description.key not in ACCUMULATED_KEYS
+
+    def _contributing_nodes(self) -> list[dict[str, Any]]:
+        """Return node dicts that should contribute to this aggregate.
+
+        Live aggregates (power, performance) only count optimizers that have
+        reported recently; energy aggregates count every known optimizer.
+        """
+        nodes = self.coordinator.data.get("nodes", {})
+        now = dt_util.utcnow()
+        result: list[dict[str, Any]] = []
+        for barcode in self._barcodes:
+            node = nodes.get(barcode)
+            if node is None:
+                continue
+            if self._is_live and not node_is_fresh(node, now):
+                continue
+            result.append(node)
+        return result
 
     async def async_added_to_hass(self) -> None:
         """Restore last known aggregate value from Home Assistant state cache."""
         await super().async_added_to_hass()
+
+        if self._is_live:
+            self._handle_coordinator_update()
+            return
 
         nodes = self.coordinator.data.get("nodes", {})
         # Only short-circuit to live data if at least one node already has
@@ -547,22 +615,28 @@ class PyTapAggregateSensor(
         """Return True when at least one constituent has data."""
         if not self.coordinator.data:
             return False
+        if self._is_live:
+            # Aggregate power/performance read 0 when every constituent is
+            # quiet, so they stay available as long as any module is known.
+            return self._any_known_node()
+        return bool(self._contributing_nodes()) or self._restored_native_value
+
+    def _any_known_node(self) -> bool:
+        """Return True if any constituent optimizer has ever reported."""
         nodes = self.coordinator.data.get("nodes", {})
-        return (
-            any(nodes.get(barcode) is not None for barcode in self._barcodes)
-            or self._restored_native_value
-        )
+        return any(nodes.get(barcode) is not None for barcode in self._barcodes)
 
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle updated data from the coordinator."""
-        nodes = self.coordinator.data.get("nodes", {})
-        has_live_nodes = any(
-            nodes.get(barcode) is not None for barcode in self._barcodes
-        )
+        contributing = self._contributing_nodes()
 
-        if not has_live_nodes:
-            if not self._restored_native_value:
+        if not contributing:
+            if self._is_live:
+                self._restored_native_value = False
+                # All constituents quiet (e.g. night) -> 0 W / 0 %.
+                self._attr_native_value = 0.0 if self._any_known_node() else None
+            elif not self._restored_native_value:
                 self._attr_native_value = None
             self.async_write_ha_state()
             return
@@ -571,11 +645,7 @@ class PyTapAggregateSensor(
             total_power = 0.0
             total_peak_power = 0.0
 
-            for barcode in self._barcodes:
-                node_data = nodes.get(barcode)
-                if node_data is None:
-                    continue
-
+            for node_data in contributing:
                 power = node_data.get("power")
                 peak_power = node_data.get(CONF_MODULE_PEAK_POWER, DEFAULT_PEAK_POWER)
                 if power is None:
@@ -605,10 +675,7 @@ class PyTapAggregateSensor(
 
         total: float | None = None
 
-        for barcode in self._barcodes:
-            node_data = nodes.get(barcode)
-            if node_data is None:
-                continue
+        for node_data in contributing:
             value = node_data.get(self.entity_description.value_key)
             if value is not None:
                 total = (total or 0.0) + value
@@ -633,8 +700,11 @@ class PyTapAggregateSensor(
     def extra_state_attributes(self) -> dict[str, Any] | None:
         """Return additional aggregate state attributes."""
         nodes = self.coordinator.data.get("nodes", {})
+        now = dt_util.utcnow()
         reporting = [
-            barcode for barcode in self._barcodes if nodes.get(barcode) is not None
+            barcode
+            for barcode in self._barcodes
+            if node_is_fresh(nodes.get(barcode), now)
         ]
         return {
             "optimizer_count": len(self._barcodes),
